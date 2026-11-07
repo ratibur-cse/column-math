@@ -1,0 +1,1020 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Column Math</title>
+<link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --page-bg: #0a4aa8;
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) { --page-bg: #062f6b; }
+  }
+  :root[data-theme="dark"] { --page-bg: #062f6b; }
+  html { height: 100%; scroll-padding-top: env(safe-area-inset-top, 0px); }
+  body {
+    margin: 0;
+    height: 100%;
+    background: var(--page-bg);
+    overflow: hidden;
+    touch-action: manipulation;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+  }
+  #game { width: 100%; height: 100%; }
+  canvas { display: block; }
+</style>
+</head>
+<body>
+<div id="game"></div>
+<script src="https://cdn.jsdelivr.net/npm/phaser@3.80.1/dist/phaser.min.js"></script>
+<script>
+(() => {
+'use strict';
+
+/* ------------------------------------------------------------------
+   Constants. Designed on a 480x800 grid, rendered at 2x via camera zoom
+   so text and shapes stay sharp on phones.
+------------------------------------------------------------------- */
+const W = 480, H = 800, Z = 2;
+const FONT = '"Fredoka","Baloo 2","Trebuchet MS","Comic Sans MS",system-ui,sans-serif';
+const NAVY = '#0b3c5d';
+const BLUE = '#1f63d6';
+// column layout (add / subtract / multiply)
+const CARRY_Y = 152, A_Y = 252, B_Y = 352, LINE_Y = 414, ANS_Y = 484, DIG = 88;
+// division layout
+const Q_Y = 210, D_Y = 350;
+const colX = p => 340 - p * 84;             // p: 0 = ones, 1 = tens, 2 = hundreds
+const PLACE = ['Ones', 'Tens', 'Hundreds'];
+const PAL = [0xff7043, 0xffb300, 0x43a047, 0x1e88e5, 0x8e24aa];
+const SYM = { add: '+', sub: '−', mul: '×', div: '÷' };
+const MODES = [
+  { key: 'add', label: 'Add',      sym: '+', color: 0x43a047, name: 'Addition' },
+  { key: 'sub', label: 'Subtract', sym: '−', color: 0xff7043, name: 'Subtraction' },
+  { key: 'mul', label: 'Multiply', sym: '×', color: 0x8e24aa, name: 'Multiplication' },
+  { key: 'div', label: 'Divide',   sym: '÷', color: 0x1e88e5, name: 'Division' }
+];
+const rnd = (a, b) => Phaser.Math.Between(a, b);
+const digs = n => String(n).split('').reverse().map(Number);   // least significant first
+
+/* ------------------------------------------------------------------
+   Tiny WebAudio sfx (no audio files needed)
+------------------------------------------------------------------- */
+const Sfx = {
+  ctx: null, on: true,
+  init() {
+    try {
+      if (!this.ctx) { const AC = window.AudioContext || window.webkitAudioContext; if (AC) this.ctx = new AC(); }
+      if (this.ctx && this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    } catch (e) {}
+  },
+  tone(freq, dur, type, vol, delay, slideTo) {
+    if (!this.on || !this.ctx) return;
+    try {
+      const t = this.ctx.currentTime + (delay || 0);
+      const o = this.ctx.createOscillator(), g = this.ctx.createGain();
+      o.type = type || 'sine';
+      o.frequency.setValueAtTime(freq, t);
+      if (slideTo) o.frequency.exponentialRampToValueAtTime(slideTo, t + dur);
+      g.gain.setValueAtTime(0.0001, t);
+      g.gain.exponentialRampToValueAtTime(vol || 0.12, t + 0.01);
+      g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+      o.connect(g); g.connect(this.ctx.destination);
+      o.start(t); o.stop(t + dur + 0.03);
+    } catch (e) {}
+  },
+  tap()   { this.tone(480, 0.05, 'triangle', 0.06); },
+  good()  { this.tone(660, 0.12, 'sine', 0.13); this.tone(880, 0.16, 'sine', 0.13, 0.09); },
+  bad()   { this.tone(230, 0.24, 'sawtooth', 0.08, 0, 130); },
+  carry() { this.tone(420, 0.22, 'square', 0.05, 0, 900); },
+  win()   { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.22, 'triangle', 0.13, i * 0.1)); },
+  level() { [392, 523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.25, 'triangle', 0.13, i * 0.09)); }
+};
+
+/* ------------------------------------------------------------------
+   Problem models. Each model has a list of "steps"; every step is one
+   digit the player has to type:
+     p      column place (0 = ones ...)
+     exp    the expected digit
+     chips  helper chips to show before asking
+              carry: yellow chip in the carry row + red arrow (add, multiply)
+              bot:   small chip in front of the bottom digit (subtract: paid back)
+              top:   small chip in front of the top digit    (subtract: borrowed 10)
+              rem:   small chip in front of the next digit   (divide: remainder)
+     prompt / hint / work   texts
+------------------------------------------------------------------- */
+function genAdd(L) {
+  const cfg = [null,
+    { aMin: 11, aMax: 79, bMin: 2,  bMax: 9,  max: 99,  carry: 0 },
+    { aMin: 12, aMax: 89, bMin: 3,  bMax: 9,  max: 99,  carry: 1 },
+    { aMin: 12, aMax: 59, bMin: 11, bMax: 39, max: 99,  carry: 1 },
+    { aMin: 25, aMax: 99, bMin: 11, bMax: 99, max: 199, carry: 1 },
+    { aMin: 35, aMax: 99, bMin: 25, bMax: 99, max: 199, carry: 2 }][L];
+  for (let i = 0; i < 500; i++) {
+    const a = rnd(cfg.aMin, cfg.aMax), b = rnd(cfg.bMin, cfg.bMax);
+    if (a + b > cfg.max) continue;
+    const c0 = (a % 10) + (b % 10) >= 10;
+    const c1 = (Math.floor(a / 10) % 10) + (Math.floor(b / 10) % 10) + (c0 ? 1 : 0) >= 10;
+    if (cfg.carry >= 1 && !c0) continue;
+    if (cfg.carry >= 2 && !c1) continue;
+    return { a, b };
+  }
+  return { a: 47, b: 38 };
+}
+
+function genSub(L) {
+  const cfg = [null,
+    { aMin: 20,  aMax: 99,  bMin: 1,  bMax: 9,  borrow: 0 },
+    { aMin: 21,  aMax: 99,  bMin: 2,  bMax: 9,  borrow: 1 },
+    { aMin: 30,  aMax: 99,  bMin: 11, bMax: 89, borrow: 1 },
+    { aMin: 101, aMax: 399, bMin: 11, bMax: 99, borrow: 1 },
+    { aMin: 201, aMax: 999, bMin: 11, bMax: 99, borrow: 2 }][L];
+  for (let i = 0; i < 600; i++) {
+    const a = rnd(cfg.aMin, cfg.aMax), b = rnd(cfg.bMin, cfg.bMax);
+    if (a - b < (a >= 100 ? 100 : 10)) continue;        // keep the same number of digits
+    const A = digs(a), B = digs(b);
+    let br = 0, cnt = 0;
+    for (let p = 0; p < A.length; p++) {
+      const need = A[p] < (B[p] || 0) + br;
+      br = need ? 1 : 0; if (need) cnt++;
+    }
+    if (br !== 0 || cnt < cfg.borrow) continue;
+    return { a, b };
+  }
+  return { a: 52, b: 27 };
+}
+
+function genMul(L) {
+  const cfg = [null,
+    { aMin: 11,  aMax: 49,  bMin: 2, bMax: 5, carry: 0 },
+    { aMin: 12,  aMax: 49,  bMin: 2, bMax: 6, carry: 1 },
+    { aMin: 12,  aMax: 99,  bMin: 3, bMax: 9, carry: 1 },
+    { aMin: 101, aMax: 333, bMin: 2, bMax: 9, carry: 1 },
+    { aMin: 112, aMax: 499, bMin: 2, bMax: 9, carry: 2 }][L];
+  for (let i = 0; i < 600; i++) {
+    const a = rnd(cfg.aMin, cfg.aMax), b = rnd(cfg.bMin, cfg.bMax);
+    if (a * b >= 1000) continue;
+    const A = digs(a);
+    let c = 0, cnt = 0;
+    for (let p = 0; p < A.length; p++) { c = Math.floor((A[p] * b + c) / 10); if (c > 0) cnt++; }
+    if (cnt < cfg.carry) continue;
+    return { a, b };
+  }
+  return { a: 23, b: 4 };
+}
+
+function genDiv(L) {
+  const cfg = [null,
+    { d: [2, 5], q: [11, 49],  rem: 0 },
+    { d: [2, 9], q: [11, 49],  rem: 1 },
+    { d: [3, 9], q: [12, 99],  rem: 1 },
+    { d: [3, 9], q: [100, 300], rem: 1 },
+    { d: [3, 9], q: [105, 333], rem: 2 }][L];
+  for (let i = 0; i < 800; i++) {
+    const d = rnd(cfg.d[0], cfg.d[1]), q = rnd(cfg.q[0], cfg.q[1]);
+    const N = d * q;
+    if (N >= 1000) continue;
+    const Dd = String(N).split('').map(Number);
+    if (Dd[0] < d) continue;                            // first digit must be divisible
+    let rem = 0, cnt = 0;
+    Dd.forEach((x, idx) => { const cur = rem * 10 + x; rem = cur % d; if (rem > 0 && idx < Dd.length - 1) cnt++; });
+    if (cnt < cfg.rem) continue;
+    return { d, N };
+  }
+  return { d: 3, N: 72 };
+}
+
+function modelAdd(a, b) {
+  const A = digs(a), B = digs(b), n = String(a + b).length, steps = [];
+  let carry = 0;
+  for (let p = 0; p < n; p++) {
+    const terms = [];
+    if (p < A.length) terms.push(A[p]);
+    if (p < B.length) terms.push(B[p]);
+    const sum = terms.reduce((x, y) => x + y, 0) + carry;
+    let prompt, hint;
+    if (terms.length === 0) {
+      prompt = PLACE[p] + ': bring down the carry ' + carry;
+      hint = 'Hint: write ' + sum;
+    } else if (terms.length === 1 && carry === 0) {
+      prompt = PLACE[p] + ': bring down ' + terms[0];
+      hint = 'Hint: write ' + sum;
+    } else {
+      const parts = terms.map(String); if (carry > 0) parts.push(carry + ' (carry)');
+      prompt = PLACE[p] + ': ' + parts.join(' + ') + ' = ?';
+      const eq = terms.concat(carry > 0 ? [carry] : []).join(' + ');
+      hint = 'Hint: ' + eq + ' = ' + sum + (sum >= 10 ? ' → write ' + (sum % 10) + ', carry ' + Math.floor(sum / 10) : ' → write ' + sum);
+    }
+    steps.push({ p, exp: sum % 10, chips: carry > 0 ? [{ kind: 'carry', val: carry }] : [], prompt, hint });
+    carry = Math.floor(sum / 10);
+  }
+  return { op: 'add', layout: 'col', key: 'add:' + a + ':' + b, a, b, A, B, steps };
+}
+
+function modelSub(a, b) {
+  const A = digs(a), B = digs(b), steps = [];
+  let borrow = 0;
+  for (let p = 0; p < A.length; p++) {
+    const bd = p < B.length ? B[p] : null;
+    const sub = (bd || 0) + borrow;
+    const need = A[p] < sub;
+    const top = A[p] + (need ? 10 : 0);
+    const exp = top - sub;
+    let prompt, hint;
+    if (bd === null && borrow === 0) {
+      prompt = PLACE[p] + ': bring down ' + top;
+      hint = 'Hint: write ' + exp;
+    } else {
+      const subs = []; if (bd !== null) subs.push(bd); if (borrow > 0) subs.push('1 (borrowed)');
+      prompt = PLACE[p] + ': ' + top + ' − ' + subs.join(' − ') + ' = ?';
+      hint = 'Hint: ' + top + ' − ' + sub + ' = ' + exp;
+    }
+    const chips = [];
+    if (borrow > 0) chips.push({ kind: 'bot', val: 1 });
+    if (need) chips.push({ kind: 'top', val: 1 });
+    steps.push({ p, exp, chips, prompt, hint });
+    borrow = need ? 1 : 0;
+  }
+  return { op: 'sub', layout: 'col', key: 'sub:' + a + ':' + b, a, b, A, B, steps };
+}
+
+function modelMul(a, b) {
+  const A = digs(a), B = [b], n = String(a * b).length, steps = [];
+  let carry = 0;
+  for (let p = 0; p < n; p++) {
+    const prod = p < A.length ? A[p] * b : 0;
+    const sum = prod + carry;
+    let prompt, hint;
+    if (p >= A.length) {
+      prompt = PLACE[p] + ': bring down the carry ' + carry;
+      hint = 'Hint: write ' + sum;
+    } else {
+      prompt = PLACE[p] + ': ' + A[p] + ' × ' + b + (carry > 0 ? ' + ' + carry + ' (carry)' : '') + ' = ?';
+      hint = 'Hint: ' + A[p] + ' × ' + b + (carry > 0 ? ' + ' + carry : '') + ' = ' + sum +
+        (sum >= 10 ? ' → write ' + (sum % 10) + ', carry ' + Math.floor(sum / 10) : ' → write ' + sum);
+    }
+    steps.push({ p, exp: sum % 10, chips: carry > 0 ? [{ kind: 'carry', val: carry }] : [], prompt, hint });
+    carry = Math.floor(sum / 10);
+  }
+  return { op: 'mul', layout: 'col', key: 'mul:' + a + ':' + b, a, b, A, B, steps };
+}
+
+function modelDiv(d, N) {
+  const Dd = String(N).split('').map(Number), nD = Dd.length, steps = [];
+  let rem = 0;
+  for (let i = 0; i < nD; i++) {
+    const p = nD - 1 - i, cur = rem * 10 + Dd[i], q = Math.floor(cur / d), nr = cur % d;
+    steps.push({
+      p, exp: q,
+      chips: (i > 0 && rem > 0) ? [{ kind: 'rem', val: rem }] : [],
+      prompt: 'Divide: ' + cur + ' ÷ ' + d + ' = ?',
+      hint: 'Hint: ' + d + ' × ' + q + ' = ' + (d * q) + (nr ? ', left over ' + nr : ''),
+      work: cur + ' ÷ ' + d + ' = ' + q + (nr ? '  remainder ' + nr : '')
+    });
+    rem = nr;
+  }
+  return { op: 'div', layout: 'div', key: 'div:' + d + ':' + N, d, N, Dd, nD, A: [], B: [], steps };
+}
+
+function makeModel(op, L) {
+  if (op === 'add') { const g = genAdd(L); return modelAdd(g.a, g.b); }
+  if (op === 'sub') { const g = genSub(L); return modelSub(g.a, g.b); }
+  if (op === 'mul') { const g = genMul(L); return modelMul(g.a, g.b); }
+  const g = genDiv(L); return modelDiv(g.d, g.N);
+}
+
+function firstModel(op) {
+  if (op === 'add') return modelAdd(22, 9);      // same as the reference picture
+  if (op === 'sub') return modelSub(52, 7);
+  if (op === 'mul') return modelMul(23, 4);
+  return modelDiv(3, 72);
+}
+
+/* ------------------------------------------------------------------
+   Drawing helpers
+------------------------------------------------------------------- */
+function txt(scene, x, y, s, size, color, extra) {
+  return scene.add.text(x, y, String(s), Object.assign({
+    fontFamily: FONT, fontSize: size + 'px', fontStyle: 'bold',
+    color: color || NAVY, resolution: Z, padding: { x: 4, y: 6 }
+  }, extra || {})).setOrigin(0.5);
+}
+
+function ensureTextures(scene) {
+  if (scene.textures.exists('dot')) return;
+  const g = scene.make.graphics({ x: 0, y: 0, add: false });
+  g.fillStyle(0xffffff, 1); g.fillCircle(8, 8, 8); g.generateTexture('dot', 16, 16); g.clear();
+  g.fillStyle(0xffffff, 1); g.fillRect(0, 0, 12, 7); g.generateTexture('conf', 12, 7);
+  g.destroy();
+}
+
+function makeBackground(scene) {
+  if (!scene.textures.exists('bgTex')) {
+    const tex = scene.textures.createCanvas('bgTex', W, H);
+    const ctx = tex.getContext();
+    const lg = ctx.createLinearGradient(0, 0, 0, H);
+    lg.addColorStop(0, '#1e88e5'); lg.addColorStop(1, '#0a3f9c');
+    ctx.fillStyle = lg; ctx.fillRect(0, 0, W, H);
+    const rg = ctx.createRadialGradient(W / 2, H * 0.36, 20, W / 2, H * 0.36, 430);
+    rg.addColorStop(0, 'rgba(120,200,255,0.38)'); rg.addColorStop(1, 'rgba(120,200,255,0)');
+    ctx.fillStyle = rg; ctx.fillRect(0, 0, W, H);
+    tex.refresh();
+  }
+  scene.add.image(0, 0, 'bgTex').setOrigin(0);
+  const glyphs = ['+', '−', '×', '÷', '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '='];
+  for (let i = 0; i < 15; i++) {
+    const t = txt(scene, rnd(20, W - 20), rnd(0, H), Phaser.Utils.Array.GetRandom(glyphs), rnd(40, 96), '#ffffff')
+      .setAlpha(0.07).setAngle(rnd(-25, 25));
+    scene.tweens.add({
+      targets: t, y: t.y - rnd(70, 170), angle: t.angle + rnd(-20, 20),
+      duration: rnd(5000, 9000), yoyo: true, repeat: -1, ease: 'Sine.easeInOut'
+    });
+  }
+}
+
+const CONFETTI = [0xffe600, 0xff5a36, 0x7ce040, 0x4fc3f7, 0xffffff, 0xff8bd0];
+
+function burst(scene, x, y, n, o) {
+  o = o || {};
+  for (let i = 0; i < n; i++) {
+    const rect = Math.random() < 0.5;
+    const p = scene.add.image(x, y, rect ? 'conf' : 'dot')
+      .setTint(Phaser.Utils.Array.GetRandom(CONFETTI)).setDepth(50)
+      .setScale(rect ? Phaser.Math.FloatBetween(0.6, 1.1) : Phaser.Math.FloatBetween(0.3, 0.7));
+    const a = Phaser.Math.FloatBetween(0, Math.PI * 2);
+    const d = rnd(o.min || 50, o.max || 140);
+    const dur = rnd(500, 850);
+    scene.tweens.add({
+      targets: p, x: x + Math.cos(a) * d, y: y + Math.sin(a) * d + 20,
+      angle: rnd(-360, 360), duration: dur, ease: 'Cubic.easeOut'
+    });
+    scene.tweens.add({
+      targets: p, alpha: 0, scale: 0, duration: dur * 0.6, delay: dur * 0.4,
+      onComplete: () => p.destroy()
+    });
+  }
+}
+
+function confettiRain(scene, n) {
+  for (let i = 0; i < n; i++) {
+    const p = scene.add.image(rnd(0, W), -20 - Math.random() * 160, 'conf')
+      .setTint(Phaser.Utils.Array.GetRandom(CONFETTI)).setDepth(70)
+      .setScale(Phaser.Math.FloatBetween(0.7, 1.3));
+    scene.tweens.add({
+      targets: p, y: H + 40, x: p.x + rnd(-90, 90), angle: rnd(180, 720),
+      duration: rnd(1400, 2500), delay: rnd(0, 500), ease: 'Quad.easeIn',
+      onComplete: () => p.destroy()
+    });
+  }
+}
+
+// Red curved arrow, drawn progressively up to t (0..1)
+function paintArrow(g, curve, t, w, color) {
+  const N = 48, k = Math.max(2, Math.round(N * t));
+  g.lineStyle(w, color, 1);
+  g.beginPath();
+  for (let i = 0; i <= k; i++) {
+    const p = curve.getPoint(i / N);
+    if (i === 0) g.moveTo(p.x, p.y); else g.lineTo(p.x, p.y);
+  }
+  g.strokePath();
+  const pe = curve.getPoint(k / N), pp = curve.getPoint(Math.max(0, k - 2) / N);
+  const a = Math.atan2(pe.y - pp.y, pe.x - pp.x), s = w * 2;
+  g.fillStyle(color, 1);
+  g.fillTriangle(
+    pe.x + Math.cos(a) * s * 0.9, pe.y + Math.sin(a) * s * 0.9,
+    pe.x - Math.sin(a) * s,       pe.y + Math.cos(a) * s,
+    pe.x + Math.sin(a) * s,       pe.y - Math.cos(a) * s
+  );
+}
+
+function makeChipGfx(scene, size) {
+  const g = scene.add.graphics();
+  const h = size / 2, r = size * 0.25, sh = Math.max(3, size * 0.09);
+  g.fillStyle(0x3a3a00, 0.28); g.fillRoundedRect(-h, -h + sh, size, size, r);
+  g.fillStyle(0xfff23a, 1);    g.fillRoundedRect(-h, -h, size, size, r);
+  g.lineStyle(size > 40 ? 4 : 3, 0x6b6a00, 1); g.strokeRoundedRect(-h, -h, size, size, r);
+  g.fillStyle(0xffffff, 0.35); g.fillRoundedRect(-h + 5, -h + 4, size - 10, size * 0.26, r * 0.6);
+  return g;
+}
+
+function makeBigBtn(scene, x, y, w, h, color, r) {
+  const c = scene.add.container(x, y);
+  const g = scene.add.graphics();
+  const dark = Phaser.Display.Color.IntegerToColor(color).darken(30).color;
+  g.fillStyle(dark, 1);        g.fillRoundedRect(-w / 2, -h / 2 + 8, w, h, r);
+  g.fillStyle(color, 1);       g.fillRoundedRect(-w / 2, -h / 2, w, h, r);
+  g.fillStyle(0xffffff, 0.22); g.fillRoundedRect(-w / 2 + 8, -h / 2 + 6, w - 16, h * 0.3, { tl: r - 8, tr: r - 8, bl: 10, br: 10 });
+  c.add(g);
+  c.setSize(w, h + 10);
+  return c;
+}
+
+/* ------------------------------------------------------------------
+   Menu scene: choose a mode
+------------------------------------------------------------------- */
+class MenuScene extends Phaser.Scene {
+  constructor() { super('Menu'); }
+
+  create() {
+    this.starting = false;
+    const cam = this.cameras.main;
+    cam.setZoom(Z).setScroll(-W / 2, -H / 2);
+    cam.fadeIn(260, 10, 60, 150);
+    ensureTextures(this);
+    makeBackground(this);
+
+    const t1 = txt(this, W / 2, -120, 'Column', 84, '#ffffff', { stroke: '#0a3f9c', strokeThickness: 12 });
+    const t2 = txt(this, W / 2, -120, 'Math!', 108, '#ffe600', { stroke: '#8a5a00', strokeThickness: 12 });
+    this.tweens.add({ targets: t1, y: 92, duration: 900, ease: 'Bounce.easeOut' });
+    this.tweens.add({ targets: t2, y: 186, duration: 900, delay: 220, ease: 'Bounce.easeOut' });
+
+    const sub = txt(this, W / 2, 262, 'Pick a game', 28, '#ffffff').setAlpha(0);
+    this.tweens.add({ targets: sub, alpha: 0.9, duration: 400, delay: 800 });
+
+    MODES.forEach((m, i) => {
+      const x = i % 2 ? 350 : 130, y = i < 2 ? 375 : 545;
+      const b = makeBigBtn(this, x, y, 200, 150, m.color, 26);
+      b.add(txt(this, 0, -24, m.sym, 96, '#ffffff', {
+        shadow: { offsetX: 0, offsetY: 4, color: 'rgba(0,0,0,0.25)', blur: 0, fill: true }
+      }));
+      b.add(txt(this, 0, 46, m.label, 32, '#ffffff'));
+      this.mount(b, i, () => this.go(m.key));
+    });
+
+    const mix = makeBigBtn(this, W / 2, 706, 420, 86, 0xffb300, 30);
+    mix.add(txt(this, 0, -1, 'Mixed   + − × ÷', 38, '#ffffff', {
+      shadow: { offsetX: 0, offsetY: 3, color: 'rgba(0,0,0,0.25)', blur: 0, fill: true }
+    }));
+    this.mount(mix, 4, () => this.go('mix'));
+  }
+
+  mount(btn, i, onClick) {
+    btn.setScale(0).setInteractive({ useHandCursor: true });
+    this.tweens.add({ targets: btn, scale: 1, duration: 500, delay: 900 + i * 110, ease: 'Back.easeOut' });
+    btn.on('pointerdown', () => {
+      if (this.starting) return;
+      Sfx.init(); Sfx.tap();
+      this.tweens.killTweensOf(btn);
+      this.tweens.add({ targets: btn, scale: 0.92, duration: 80, yoyo: true, ease: 'Quad.easeOut', onComplete: onClick });
+    });
+  }
+
+  go(mode) {
+    if (this.starting) return;
+    this.starting = true;
+    Sfx.init(); Sfx.good();
+    const cam = this.cameras.main;
+    cam.fadeOut(280, 10, 60, 150);
+    cam.once('camerafadeoutcomplete', () => this.scene.start('Game', { mode }));
+  }
+}
+
+/* ------------------------------------------------------------------
+   Game scene
+------------------------------------------------------------------- */
+class GameScene extends Phaser.Scene {
+  constructor() { super('Game'); }
+
+  init(data) { this.mode = (data && data.mode) || 'add'; }
+
+  create() {
+    const cam = this.cameras.main;
+    cam.setZoom(Z).setScroll(-W / 2, -H / 2);
+    cam.fadeIn(320, 10, 60, 150);
+    ensureTextures(this);
+    makeBackground(this);
+
+    this.dead = false; this.leaving = false;
+    this.level = 1; this.score = 0; this.streak = 0; this.solved = 0; this.problemNo = 0;
+    this.locked = true; this.expect = null; this.lastKey = ''; this.lastOp = '';
+    this.scoreView = { v: 0 };
+    this.bar = { f: 0 };
+    this.events.once('shutdown', () => { this.dead = true; });
+
+    this.buildHud();
+    this.buildCard();
+    this.buildPad();
+
+    const info = MODES.find(m => m.key === this.mode);
+    this.prompt = txt(this, W / 2, 578, info ? info.name : 'Mixed practice', 24, '#ffffff', {
+      align: 'center', wordWrap: { width: 440 },
+      shadow: { offsetX: 0, offsetY: 3, color: 'rgba(0,0,0,0.3)', blur: 0, fill: true }
+    });
+
+    this.input.keyboard.on('keydown', e => {
+      const k = e.key;
+      if (k && k.length === 1 && k >= '0' && k <= '9') {
+        const d = +k;
+        this.padBtns[d].press();
+        this.pressDigit(d);
+      }
+    });
+
+    this.runLoop();
+  }
+
+  /* ---------- promise helpers ---------- */
+  tw(cfg) { return new Promise(res => this.tweens.add(Object.assign({}, cfg, { onComplete: () => res() }))); }
+  wait(ms) { return new Promise(res => this.time.delayedCall(ms, res)); }
+
+  /* ---------- static UI ---------- */
+  buildHud() {
+    const g = this.add.graphics();
+    g.fillStyle(0xffffff, 0.16);
+    g.fillCircle(38, 34, 20);                    // home
+    g.fillRoundedRect(64, 14, 100, 40, 20);      // level
+    g.fillRoundedRect(172, 14, 128, 40, 20);     // score
+    g.fillRoundedRect(308, 14, 80, 40, 20);      // streak
+    g.fillCircle(430, 34, 20);                   // sound
+    txt(this, 38, 35, '🏠', 20, '#ffffff');
+    this.lvlText = txt(this, 114, 34, 'LEVEL 1', 18, '#ffffff');
+    this.star = this.add.star(194, 34, 5, 7, 15, 0xffd54a).setStrokeStyle(2, 0xb8860b);
+    this.scoreText = txt(this, 212, 34, '0', 32, '#ffffff').setOrigin(0, 0.5);
+    this.streakText = txt(this, 348, 34, '🔥 0', 20, '#ffffff');
+    this.sndText = txt(this, 430, 35, Sfx.on ? '🔊' : '🔇', 22, '#ffffff');
+
+    const home = this.add.zone(38, 34, 46, 46).setInteractive({ useHandCursor: true });
+    home.on('pointerdown', () => this.goHome());
+    const snd = this.add.zone(430, 34, 46, 46).setInteractive({ useHandCursor: true });
+    snd.on('pointerdown', () => {
+      Sfx.init(); Sfx.on = !Sfx.on;
+      this.sndText.setText(Sfx.on ? '🔊' : '🔇');
+      Sfx.tap();
+    });
+
+    const track = this.add.graphics();
+    track.fillStyle(0x000000, 0.22); track.fillRoundedRect(30, 66, 420, 10, 5);
+    this.barG = this.add.graphics();
+    this.drawBar();
+  }
+
+  goHome() {
+    if (this.leaving) return;
+    this.leaving = true; this.dead = true;
+    Sfx.init(); Sfx.tap();
+    const cam = this.cameras.main;
+    cam.fadeOut(240, 10, 60, 150);
+    cam.once('camerafadeoutcomplete', () => this.scene.start('Menu'));
+  }
+
+  drawBar() {
+    const g = this.barG; g.clear();
+    const w = Math.max(0, 420 * this.bar.f);
+    if (w < 1) return;
+    g.fillStyle(0x7ce040, 1); g.fillRoundedRect(30, 66, Math.max(10, w), 10, 5);
+    g.fillStyle(0xffffff, 0.3); g.fillRoundedRect(34, 68, Math.max(4, w - 8), 3, 2);
+  }
+
+  buildCard() {
+    const g = this.add.graphics();
+    g.fillStyle(0x000000, 0.28); g.fillRoundedRect(30, 96, 420, 462, 22);
+    g.fillStyle(0xffffff, 1);    g.fillRoundedRect(30, 86, 420, 462, 22);
+    g.fillStyle(0xdff2fb, 1);    g.fillRoundedRect(42, 98, 396, 438, 12);
+    g.lineStyle(1, 0xc3e1f0, 1);
+    for (let x = 64; x < 438; x += 22) g.lineBetween(x, 98, x, 536);
+    for (let y = 120; y < 536; y += 22) g.lineBetween(42, y, 438, y);
+  }
+
+  buildPad() {
+    this.padBtns = {};
+    [1, 2, 3, 4, 5, 6, 7, 8, 9, 0].forEach((d, i) => {
+      this.padBtns[d] = this.makePadBtn(56 + (i % 5) * 92, 646 + Math.floor(i / 5) * 90, d, PAL[i % 5]);
+    });
+  }
+
+  makePadBtn(x, y, d, color) {
+    const w = 84, h = 76, r = 18;
+    const c = this.add.container(x, y);
+    const g = this.add.graphics();
+    const dark = Phaser.Display.Color.IntegerToColor(color).darken(30).color;
+    g.fillStyle(dark, 1);        g.fillRoundedRect(-w / 2, -h / 2 + 7, w, h, r);
+    g.fillStyle(color, 1);       g.fillRoundedRect(-w / 2, -h / 2, w, h, r);
+    g.fillStyle(0xffffff, 0.24); g.fillRoundedRect(-w / 2 + 6, -h / 2 + 5, w - 12, h * 0.3, { tl: r - 6, tr: r - 6, bl: 8, br: 8 });
+    c.add(g);
+    c.add(txt(this, 0, -1, d, 46, '#ffffff', {
+      shadow: { offsetX: 0, offsetY: 3, color: 'rgba(0,0,0,0.28)', blur: 0, fill: true }
+    }));
+    c.setSize(w, h + 8).setInteractive({ useHandCursor: true });
+    const press = () => {
+      this.tweens.killTweensOf(c); c.setScale(1);
+      this.tweens.add({ targets: c, scale: 0.9, duration: 70, yoyo: true, ease: 'Quad.easeOut' });
+    };
+    c.on('pointerdown', () => { press(); this.pressDigit(d); });
+    return { c, press };
+  }
+
+  /* ---------- hud updates ---------- */
+  bump(obj, s) {
+    this.tweens.killTweensOf(obj); obj.setScale(1);
+    this.tweens.add({ targets: obj, scale: s || 1.25, duration: 110, yoyo: true, ease: 'Quad.easeOut' });
+  }
+
+  addScore(n, x, y) {
+    this.score += n;
+    this.tweens.add({
+      targets: this.scoreView, v: this.score, duration: 420, ease: 'Cubic.easeOut',
+      onUpdate: () => this.scoreText.setText(Math.round(this.scoreView.v))
+    });
+    this.bump(this.star, 1.4);
+    this.streakText.setText('🔥 ' + this.streak); this.bump(this.streakText, 1.15);
+    if (x !== undefined) this.floatText(x, y, '+' + n, '#ffe600');
+  }
+
+  floatText(x, y, s, color) {
+    const t = txt(this, x, y, s, 34, color, { stroke: '#0b3c5d', strokeThickness: 6 }).setDepth(60).setScale(0.4);
+    this.tweens.add({ targets: t, scale: 1, duration: 200, ease: 'Back.easeOut' });
+    this.tweens.add({ targets: t, y: y - 60, alpha: 0, duration: 800, delay: 150, ease: 'Cubic.easeOut', onComplete: () => t.destroy() });
+  }
+
+  setPrompt(s) {
+    this.prompt.setText(s).setScale(0.88);
+    this.tweens.add({ targets: this.prompt, scale: 1, duration: 260, ease: 'Back.easeOut' });
+  }
+
+  /* ---------- picking problems ---------- */
+  pickOp() {
+    if (this.mode !== 'mix') return this.mode;
+    let op;
+    do { op = Phaser.Utils.Array.GetRandom(['add', 'sub', 'mul', 'div']); }
+    while (op === this.lastOp && Math.random() < 0.85);
+    return op;
+  }
+
+  newModel() {
+    if (this.problemNo === 0) {
+      const op = this.mode === 'mix' ? 'add' : this.mode;
+      this.lastOp = op;
+      return firstModel(op);
+    }
+    const op = this.pickOp(), L = Math.min(this.level, 5);
+    this.lastOp = op;
+    let m;
+    for (let i = 0; i < 6; i++) { m = makeModel(op, L); if (m.key !== this.lastKey) break; }
+    return m;
+  }
+
+  /* ---------- main loop ---------- */
+  async runLoop() {
+    try {
+      await this.wait(500);
+      while (!this.dead) await this.playProblem();
+    } catch (e) { if (!this.dead) console.error(e); }
+  }
+
+  async playProblem() {
+    const M = this.newModel();
+    this.problemNo++; this.lastKey = M.key;
+
+    const board = this.add.container(W + 80, 0);
+    const S = {
+      M, board, slots: [], arrows: {}, chips: [], workN: 0,
+      hl: { x: colX(0), top: 0, bottom: 0, a: 0 },
+      ansY: M.layout === 'div' ? Q_Y : ANS_Y, helper: null
+    };
+    this.cur = S;
+
+    S.hlG = this.add.graphics(); board.add(S.hlG);
+
+    const pops = M.layout === 'div' ? this.buildDivBoard(S) : this.buildColBoard(S);
+
+    for (let i = 0; i < M.steps.length; i++) {
+      const p = i;                       // slots are indexed by place; every place has exactly one step
+      const c = this.add.container(colX(p), S.ansY);
+      const g = this.add.graphics();
+      const t = txt(this, 0, -2, '', DIG, NAVY);
+      c.add([g, t]);
+      board.add(c);
+      const s = { c, g, t, baseX: colX(p), baseY: S.ansY };
+      this.drawSlot(s, 'idle');
+      S.slots[p] = s;
+    }
+
+    await this.tw({ targets: board, x: 0, duration: 520, ease: 'Back.easeOut' });
+    pops.forEach(o => this.tweens.add({ targets: o.t, scale: 1, duration: 320, delay: o.delay - 250, ease: 'Back.easeOut' }));
+    await this.wait(520);
+
+    for (let i = 0; i < M.steps.length; i++) {
+      await this.activate(S, i);
+      await this.askDigit(S, i);
+      await this.commit(S, i);
+    }
+
+    await this.celebrate(S);
+
+    S.slots.forEach(s => this.tweens.killTweensOf([s.c, s.g, s.t]));
+    await this.tw({ targets: board, x: -W - 80, duration: 420, ease: 'Cubic.easeIn' });
+    board.destroy();
+  }
+
+  /* ---------- boards ---------- */
+  buildColBoard(S) {
+    const { M, board } = S, { A, B } = M;
+    const pops = [];
+    const add = (t, delay) => { board.add(t); t.setScale(0); pops.push({ t, delay }); return t; };
+    A.forEach((d, p) => add(txt(this, colX(p), A_Y, d, DIG), 250 + p * 70));
+    S.bTexts = [];
+    B.forEach((d, p) => { S.bTexts[p] = add(txt(this, colX(p), B_Y, d, DIG), 400 + p * 70); });
+    add(txt(this, colX(B.length), B_Y, SYM[M.op], 72, BLUE), 520);
+    if (M.op === 'mul') S.helper = S.bTexts[0];
+
+    const lg = this.add.graphics();
+    lg.lineStyle(7, 0x1f63d6, 1); lg.lineBetween(colX(2) - 56, LINE_Y, colX(0) + 56, LINE_Y);
+    board.add(lg);
+    return pops;
+  }
+
+  buildDivBoard(S) {
+    const { M, board } = S;
+    const nD = M.nD;
+    const pops = [];
+    const add = (t, delay) => { board.add(t); t.setScale(0); pops.push({ t, delay }); return t; };
+    const bx = colX(nD - 1) - 50;
+    M.Dd.forEach((d, i) => add(txt(this, colX(nD - 1 - i), D_Y, d, DIG), 250 + i * 70));
+    S.helper = add(txt(this, bx - 40, D_Y, M.d, DIG, BLUE), 420);
+
+    const g = this.add.graphics();
+    g.lineStyle(7, 0x1f63d6, 1);
+    g.beginPath();
+    g.moveTo(colX(0) + 54, D_Y - 50);
+    g.lineTo(bx, D_Y - 50);
+    g.lineTo(bx - 6, D_Y + 52);
+    g.strokePath();
+    board.add(g);
+    return pops;
+  }
+
+  colBox(S, step) {
+    const M = S.M, p = step.p;
+    if (M.layout === 'div') return { top: Q_Y - 56, bottom: D_Y + 52 };
+    if (M.op === 'sub') return { top: A_Y - 56, bottom: B_Y + 54 };
+    return {
+      top: CARRY_Y - 46,
+      bottom: p < M.B.length ? B_Y + 54 : (p < M.A.length ? A_Y + 54 : CARRY_Y + 38)
+    };
+  }
+
+  /* ---------- slots, highlight ---------- */
+  drawSlot(s, state) {
+    const g = s.g, w = 72, h = 92, r = 16;
+    g.clear();
+    if (state === 'idle') {
+      g.fillStyle(0xffffff, 0.35); g.fillRoundedRect(-w / 2, -h / 2, w, h, r);
+      g.lineStyle(3, 0x7fb0c8, 0.8); g.strokeRoundedRect(-w / 2, -h / 2, w, h, r);
+      return;
+    }
+    const face = state === 'wrong' ? 0xff8a80 : 0x8be34d;
+    const edge = state === 'wrong' ? 0xc62828 : 0x2a7a12;
+    g.fillStyle(edge, 1);  g.fillRoundedRect(-w / 2, -h / 2 + 6, w, h, r);
+    g.fillStyle(face, 1);  g.fillRoundedRect(-w / 2, -h / 2, w, h, r);
+    g.lineStyle(4, edge, 1); g.strokeRoundedRect(-w / 2, -h / 2, w, h, r);
+    g.fillStyle(0xffffff, 0.28); g.fillRoundedRect(-w / 2 + 7, -h / 2 + 6, w - 14, h * 0.26, { tl: 10, tr: 10, bl: 4, br: 4 });
+  }
+
+  drawHl(S) {
+    const h = S.hl, g = S.hlG;
+    g.clear();
+    if (h.a <= 0.01) return;
+    g.fillStyle(0x2f8fff, 0.1 * h.a);  g.fillRect(h.x - 40, h.top, 80, h.bottom - h.top);
+    g.lineStyle(4, 0x0b3c5d, h.a);     g.strokeRect(h.x - 40, h.top, 80, h.bottom - h.top);
+  }
+
+  /* ---------- chips ---------- */
+  chipSpec(kind, p) {
+    switch (kind) {
+      case 'carry': return { x: colX(p),      y: CARRY_Y, size: 56, fs: 42, arrow: true, dy: 30 };
+      case 'top':   return { x: colX(p) - 34, y: A_Y - 36, size: 36, fs: 26, dy: 0 };
+      case 'bot':   return { x: colX(p) - 34, y: B_Y - 36, size: 36, fs: 26, dy: 0 };
+      default:      return { x: colX(p) - 36, y: D_Y - 30, size: 34, fs: 24, dy: 0 };   // rem
+    }
+  }
+
+  async popChip(S, spec, val) {
+    const c = this.add.container(spec.x, spec.y - spec.size * 0.55);
+    c.add(makeChipGfx(this, spec.size));
+    c.add(txt(this, 0, 0, val, spec.fs));
+    c.setScale(0).setAngle(-30);
+    S.board.add(c); S.chips.push(c);
+    await this.tw({ targets: c, scale: 1, angle: 0, y: spec.y, duration: 380, ease: 'Back.easeOut' });
+  }
+
+  flyDot(P0, P2) {
+    const V = (x, y) => new Phaser.Math.Vector2(x, y);
+    const a = V(P0.x, P0.y), c = V(P2.x, P2.y);
+    const m = V((a.x + c.x) / 2 + 95, (a.y + c.y) / 2);
+    const dot = this.add.circle(a.x, a.y, 15, 0xfff23a).setStrokeStyle(4, 0x6b6a00).setDepth(40);
+    const o = { t: 0 };
+    return this.tw({
+      targets: o, t: 1, duration: 520, ease: 'Sine.easeInOut',
+      onUpdate: () => {
+        const t = o.t, u = 1 - t;
+        dot.x = u * u * a.x + 2 * u * t * m.x + t * t * c.x;
+        dot.y = u * u * a.y + 2 * u * t * m.y + t * t * c.y;
+        const tr = this.add.image(dot.x, dot.y, 'dot').setTint(0xfff23a).setScale(0.6).setDepth(39);
+        this.tweens.add({ targets: tr, alpha: 0, scale: 0, duration: 320, onComplete: () => tr.destroy() });
+      }
+    }).then(() => dot.destroy());
+  }
+
+  drawArrow(S, p) {
+    const V = (x, y) => new Phaser.Math.Vector2(x, y);
+    const sx = colX(p) - 34, sy = CARRY_Y + 6, ex = colX(p) - 50, ey = ANS_Y + 2;
+    const curve = new Phaser.Curves.CubicBezier(V(sx, sy), V(sx - 90, sy + 40), V(ex - 90, ey - 50), V(ex, ey));
+    const ag = this.add.graphics(); S.board.add(ag); S.arrows[p] = ag;
+    const o = { t: 0 };
+    return this.tw({
+      targets: o, t: 1, duration: 650, ease: 'Sine.easeInOut',
+      onUpdate: () => { ag.clear(); paintArrow(ag, curve, Math.max(0.03, o.t), 9, 0xff4a1c); }
+    });
+  }
+
+  /* ---------- one step ---------- */
+  async activate(S, i) {
+    const M = S.M, st = M.steps[i], p = st.p;
+    const box = this.colBox(S, st);
+
+    let move;
+    if (i === 0) {
+      S.hl.x = colX(p); S.hl.top = box.top; S.hl.bottom = box.bottom;
+      move = this.tw({ targets: S.hl, a: 1, duration: 260, onUpdate: () => this.drawHl(S) });
+    } else {
+      move = this.tw({
+        targets: S.hl, x: colX(p), top: box.top, bottom: box.bottom, duration: 420, ease: 'Cubic.easeInOut',
+        onUpdate: () => this.drawHl(S)
+      });
+    }
+
+    if (S.helper) this.bump(S.helper, 1.22);
+
+    const incoming = st.chips.find(c => c.kind !== 'top');
+    if (incoming) {
+      Sfx.carry();
+      const spec = this.chipSpec(incoming.kind, p);
+      const prevP = M.steps[i - 1].p;
+      const from = M.layout === 'div' ? { x: colX(prevP), y: Q_Y + 52 } : { x: colX(prevP), y: ANS_Y - 56 };
+      await Promise.all([move, this.flyDot(from, { x: spec.x, y: spec.y + spec.dy })]);
+      await this.popChip(S, spec, incoming.val);
+      if (spec.arrow) await this.drawArrow(S, p);
+    } else {
+      await move;
+    }
+
+    const top = st.chips.find(c => c.kind === 'top');
+    if (top) {
+      Sfx.carry();
+      await this.popChip(S, this.chipSpec('top', p), top.val);
+    }
+
+    const s = S.slots[p];
+    this.drawSlot(s, 'active');
+    s.t.setText('?').setColor('#1f6a10').setAlpha(0.45).setScale(1);
+    this.tweens.add({ targets: s.g, scale: 1.07, duration: 650, yoyo: true, repeat: -1, ease: 'Sine.easeInOut' });
+    this.bump(s.c, 1.12);
+  }
+
+  askDigit(S, i) {
+    const st = S.M.steps[i];
+    this.setPrompt(st.prompt);
+    return new Promise(resolve => {
+      this.expect = { S, st, wrong: 0, resolve };
+      this.locked = false;
+    });
+  }
+
+  pressDigit(d) {
+    Sfx.init();
+    if (this.locked || !this.expect) { Sfx.tap(); return; }
+    const e = this.expect, s = e.S.slots[e.st.p];
+    if (d === e.st.exp) {
+      this.locked = true;
+      this.expect = null;
+      e.resolve();
+      return;
+    }
+    // wrong answer
+    Sfx.bad();
+    this.streak = 0;
+    this.streakText.setText('🔥 0'); this.bump(this.streakText, 1.15);
+    e.wrong++;
+    this.cameras.main.shake(140, 0.004);
+    this.drawSlot(s, 'wrong');
+    s.t.setText(String(d)).setColor('#c62828').setAlpha(1);
+    if (!s.shaking) {
+      s.shaking = true;
+      this.tweens.add({
+        targets: s.c, x: { from: s.baseX - 11, to: s.baseX + 11 }, duration: 55, yoyo: true, repeat: 3,
+        onComplete: () => { s.c.x = s.baseX; s.shaking = false; }
+      });
+    }
+    if (e.wrong >= 2) this.setPrompt(e.st.hint);
+    if (s.resetTimer) s.resetTimer.remove(false);
+    s.resetTimer = this.time.delayedCall(480, () => {
+      if (this.expect === e) {
+        this.drawSlot(s, 'active');
+        s.t.setText('?').setColor('#1f6a10').setAlpha(0.45);
+      }
+    });
+  }
+
+  async commit(S, i) {
+    const st = S.M.steps[i], s = S.slots[st.p];
+    if (s.resetTimer) s.resetTimer.remove(false);
+    this.tweens.killTweensOf(s.g); s.g.setScale(1);
+    this.drawSlot(s, 'active');
+    s.t.setText(String(st.exp)).setColor(NAVY).setAlpha(1).setScale(0);
+    Sfx.good();
+    this.tweens.add({ targets: s.t, scale: 1, duration: 340, ease: 'Back.easeOut' });
+    this.tweens.add({ targets: s.g, alpha: 0, duration: 350, delay: 260 });
+    burst(this, s.c.x, s.c.y, 12, { min: 40, max: 110 });
+    this.streak++;
+    this.addScore(5, s.c.x, s.c.y - 60);
+    if (S.arrows[st.p]) this.tweens.add({ targets: S.arrows[st.p], alpha: 0, duration: 300 });
+    if (st.work) this.addWork(S, st.work);
+    await this.wait(400);
+  }
+
+  addWork(S, str) {
+    const y = 428 + S.workN * 36;
+    S.workN++;
+    const t = txt(this, W / 2, y, str, 26, NAVY).setAlpha(0);
+    t.x -= 34;
+    S.board.add(t);
+    this.tweens.add({ targets: t, alpha: 0.8, x: W / 2, duration: 320, ease: 'Cubic.easeOut' });
+  }
+
+  async celebrate(S) {
+    Sfx.win();
+    this.tweens.add({ targets: S.hl, a: 0, duration: 250, onUpdate: () => this.drawHl(S) });
+    // slots are indexed by place; for division the quotient reads left→right (high place first)
+    const order = S.M.layout === 'div' ? S.slots.slice().reverse() : S.slots;
+    order.forEach((s, i) => {
+      s.t.setColor('#1b9c3f');
+      this.tweens.add({ targets: s.c, y: s.baseY - 28, duration: 230, yoyo: true, delay: i * 90, ease: 'Quad.easeOut' });
+      this.tweens.add({ targets: s.t, scale: 1.22, duration: 230, yoyo: true, delay: i * 90, ease: 'Back.easeOut' });
+    });
+    burst(this, W / 2, S.ansY, 34, { min: 80, max: 230 });
+    confettiRain(this, 22);
+    this.addScore(10, W / 2, S.ansY - 80);
+    this.setPrompt(Phaser.Utils.Array.GetRandom(['Great job!', 'Awesome!', 'Perfect!', 'Brilliant!', 'Nice work!']));
+
+    this.solved++;
+    const full = this.solved >= 5;
+    await this.tw({ targets: this.bar, f: full ? 1 : this.solved / 5, duration: 450, ease: 'Cubic.easeOut', onUpdate: () => this.drawBar() });
+    await this.wait(700);
+
+    if (full) {
+      this.solved = 0; this.level++;
+      await this.levelUp();
+      this.lvlText.setText('LEVEL ' + this.level); this.bump(this.lvlText, 1.3);
+      await this.tw({ targets: this.bar, f: 0, duration: 400, ease: 'Cubic.easeInOut', onUpdate: () => this.drawBar() });
+    }
+  }
+
+  async levelUp() {
+    Sfx.level();
+    const c = this.add.container(W / 2, 320).setDepth(80).setScale(0);
+    const g = this.add.graphics();
+    g.fillStyle(0x000000, 0.4);  g.fillRoundedRect(-200, -70, 400, 170, 30);
+    g.fillStyle(0x0a3f9c, 1);    g.fillRoundedRect(-200, -80, 400, 170, 30);
+    g.lineStyle(5, 0xffe600, 1); g.strokeRoundedRect(-200, -80, 400, 170, 30);
+    c.add(g);
+    c.add(txt(this, 0, -22, 'LEVEL UP!', 66, '#ffe600', { stroke: '#8a5a00', strokeThickness: 8 }));
+    c.add(txt(this, 0, 42, 'Now on level ' + this.level, 30, '#ffffff'));
+    await this.tw({ targets: c, scale: 1, angle: { from: -6, to: 0 }, duration: 480, ease: 'Back.easeOut' });
+    confettiRain(this, 40);
+    await this.wait(1200);
+    await this.tw({ targets: c, alpha: 0, scale: 1.25, duration: 300, ease: 'Quad.easeIn' });
+    c.destroy();
+  }
+}
+
+/* ------------------------------------------------------------------
+   Boot (wait briefly for the web font so canvas text uses it)
+------------------------------------------------------------------- */
+function boot() {
+  new Phaser.Game({
+    type: Phaser.AUTO,
+    parent: 'game',
+    width: W * Z,
+    height: H * Z,
+    backgroundColor: '#0a4aa8',
+    scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH },
+    input: { activePointers: 3 },
+    scene: [MenuScene, GameScene]
+  });
+}
+
+const fontReady = (document.fonts && document.fonts.load)
+  ? document.fonts.load('bold 40px "Fredoka"').catch(() => {})
+  : Promise.resolve();
+Promise.race([fontReady, new Promise(r => setTimeout(r, 1800))]).then(boot, boot);
+})();
+</script>
+</body>
+</html>
